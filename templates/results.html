@@ -1,0 +1,154 @@
+{% extends "base.html" %}
+{% block title %}Contest Results{% endblock %}
+{% block head %}
+<style>
+    body {
+        height: auto;
+        align-items: flex-start;
+        padding-top: 20px;
+    }
+    .container {
+        max-width: 800px;
+        padding: 2rem;
+    }
+    .chart-container {
+        position: relative;
+        height: 500px;
+        width: 100%;
+    }
+    .loading {
+        display: none;
+        text-align: center;
+        padding: 1rem;
+        color: #4CAF50;
+    }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+{% endblock %}
+{% block content %}
+<h2 class="text-center mb-4">{{ contest.title or (stat_category ~ ' Standings for ' ~ contest.start_date ~ ' to ' ~ contest.end_date) }}</h2>
+{% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+        <div class="alert alert-{{ messages[0][0] }}">
+            {% for category, message in messages %}
+                {{ message }}
+            {% endfor %}
+        </div>
+    {% endif %}
+{% endwith %}
+<div class="loading" id="loading">Loading results...</div>
+{% if status.is_started == False %}
+    <p class="text-center text-info"><strong>Contest not started yet. Starts in {{ status.days_to_start }} days</strong></p>
+{% elif status.is_complete == False %}
+    <p class="text-center text-info"><strong>Contest in progress. {{ status.days_remaining }} days remaining</strong></p>
+{% else %}
+    <p class="text-center text-success"><strong>Contest Complete. 
+        {% if status.winner | length > 1 %}
+            Winner: Tied between {{ status.winner | join(', ') }}
+        {% elif status.winner | length == 1 %}
+            Winner: {{ status.winner[0] }}
+        {% else %}
+            No winner (no data)
+        {% endif %}
+    </strong></p>
+{% endif %}
+{% if warning_message %}
+    <p class="text-center text-danger">{{ warning_message }}</p>
+{% endif %}
+{% if status.is_started %}
+    <div class="chart-container">
+        <canvas id="rankingsChart"></canvas>
+    </div>
+    <table class="table table-striped table-hover mt-4">
+        <thead class="table-dark">
+            <tr><th>Team</th><th>{{ stat_category }}</th></tr>
+        </thead>
+        <tbody>
+            {% for team, value in rankings %}
+                <tr><td>{{ team }}</td><td>{{ value | format_stat(stat_category) }}</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+{% endif %}
+<div class="nav-link text-center mt-3">
+    <a href="{{ url_for('dashboard') }}">Back to Dashboard</a> |
+    <a href="{{ url_for('create_contest') }}">Create New Contest</a> |
+    <a href="{{ url_for('link_league') }}">Link Another League</a> |
+    {% if current_user.is_authenticated %}
+        <a href="{{ url_for('logout') }}">Logout</a>
+    {% endif %}
+</div>
+<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const loading = document.getElementById('loading');
+        loading.style.display = 'block';
+        setTimeout(() => { loading.style.display = 'none'; }, 1000);
+    });
+    const ctx = document.getElementById('rankingsChart').getContext('2d');
+    new Chart(ctx, {
+        type: 'bar',
+        data: {{ chart_data | tojson }},
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            layout: {
+                padding: {
+                    top: 0,
+                    bottom: 30,
+                    left: 10,
+                    right: 10
+                }
+            },
+            scales: {
+                y: { 
+                    beginAtZero: true,
+                    grace: '5%',
+                    title: { 
+                        display: true, 
+                        text: '{{ stat_category }}',
+                        padding: { top: 20, bottom: 0 }
+                    },
+                    ticks: {
+                        padding: 15
+                    }
+                },
+                x: { 
+                    title: { 
+                        display: true, 
+                        text: 'Team',
+                        padding: { top: 10, bottom: 0 }
+                    },
+                    ticks: {
+                        autoSkip: false,
+                        maxRotation: 45,
+                        minRotation: 45,
+                        padding: 15,
+                        font: {
+                            size: 12
+                        },
+                        callback: function(value, index, ticks) {
+                            const label = this.getLabelForValue(value);
+                            const words = label.split(' ');
+                            const lines = [];
+                            let currentLine = '';
+                            words.forEach(word => {
+                                if ((currentLine + word).length > 15) {
+                                    lines.push(currentLine.trim());
+                                    currentLine = word + ' ';
+                                } else {
+                                    currentLine += word + ' ';
+                                }
+                            });
+                            if (currentLine) lines.push(currentLine.trim());
+                            return lines;
+                        }
+                    }
+                }
+            },
+            plugins: { 
+                legend: { display: false } 
+            }
+        }
+    });
+</script>
+{% endblock %}

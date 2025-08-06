@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}My Linked Leagues{% endblock %}
+{% block head %}
+<style>
+    body {
+        height: auto;
+        display: block;
+        padding-top: 20px;
+    }
+    .container {
+        max-width: 800px;
+    }
+    .btn-danger {
+        background-color: #F44336;
+        border-color: #F44336;
+    }
+    .btn-danger:hover {
+        background-color: #D32F2F;
+        border-color: #D32F2F;
+    }
+</style>
+{% endblock %}
+{% block content %}
+<h2 class="text-center mb-4">My Linked Leagues</h2>
+{% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+        {% for category, message in messages %}
+            <div class="alert {% if category == 'error' %}alert-danger{% else %}alert-success{% endif %} text-center">
+                {{ message }}
+            </div>
+        {% endfor %}
+    {% endif %}
+{% endwith %}
+{% if leagues_forms | length > 0 %}
+    <table class="table table-striped table-hover">
+        <thead class="table-dark">
+            <tr>
+                <th>League Name</th>
+                <th>ESPN League ID</th>
+                <th>Action</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for league, form in leagues_forms %}
+            <tr>
+                <td>{{ league.name }}</td>
+                <td>{{ league.espn_league_id }}</td>
+                <td>
+                    <form method="POST" action="{{ url_for('my_leagues') }}" onsubmit="return confirm('Are you sure you want to delete this league? This will also delete any associated contests.');">
+                        {{ form.hidden_tag() }}
+                        <button type="submit" class="btn btn-danger btn-sm">Delete</button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+{% else %}
+    <div class="alert alert-info text-center">
+        You have no linked leagues yet. <a href="{{ url_for('link_league') }}" class="alert-link">Link one now</a>.
+    </div>
+{% endif %}
+<div class="nav-link text-center mt-3">
+    <a href="{{ url_for('link_league') }}">Link New League</a> |
+    <a href="{{ url_for('create_contest') }}">Create Contest</a> |
+    <a href="{{ url_for('home') }}">Home</a> |
+    {% if current_user.is_authenticated %}
+        <a href="{{ url_for('logout') }}">Logout</a>
+    {% endif %}
+</div>
+{% endblock %}

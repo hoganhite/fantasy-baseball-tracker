@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Link League{% endblock %}
+{% block content %}
+<h2 class="text-center mb-4">Link Your ESPN Fantasy League</h2>
+<p class="text-muted mb-4">Provide your League ID from the ESPN URL, and your authentication cookies (espn_s2 and SWID) from your browser's developer tools.</p>
+{% with messages = get_flashed_messages() %}
+    {% if messages %}
+        <div class="alert alert-danger">
+            {% for message in messages %}
+                {{ message }}
+            {% endfor %}
+        </div>
+    {% endif %}
+{% endwith %}
+<form method="POST">
+    {{ form.hidden_tag() }}
+    <div class="mb-3">
+        <label class="form-label">League ID</label>
+        {{ form.league_id(class="form-control") }}
+    </div>
+    <div class="mb-3">
+        <label class="form-label">ESPN S2 Cookie</label>
+        {{ form.espn_s2(class="form-control") }}
+    </div>
+    <div class="mb-3">
+        <label class="form-label">SWID</label>
+        {{ form.swid(class="form-control") }}
+    </div>
+    <button type="submit" class="btn btn-primary w-100">{{ form.submit.label.text }}</button>
+</form>
+<div class="nav-link text-center mt-3">
+    <a href="{{ url_for('my_leagues') }}">View My Leagues</a> |
+    <a href="{{ url_for('create_contest') }}">Create Contest</a>
+</div>
+{% endblock %}
