@@ -12,3 +12,4 @@ psycopg[c]>=3.2.1
 espn-api==0.36.0
 WTForms==3.1.2
 psycopg2-binary==2.9.9
+email_validator==2.2.0
