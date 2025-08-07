@@ -15,6 +15,7 @@ import logging
 from cryptography.fernet import Fernet, InvalidToken
 import base64
 from collections import defaultdict
+import requests.exceptions
 
 # Load environment variables
 load_dotenv()
@@ -54,7 +55,7 @@ db = SQLAlchemy(app)
 # Configure Flask-Caching with FileSystemCache
 app.config['CACHE_TYPE'] = 'FileSystemCache'
 app.config['CACHE_DIR'] = cache_dir
-app.config['CACHE_DEFAULT_TIMEOUT'] = 3600  # 1 hour for fresher data
+app.config['CACHE_DEFAULT_TIMEOUT'] = 86400  # 1 day for longer caching
 cache = Cache(app)
 
 # Logging setup
@@ -68,6 +69,7 @@ mlb_id_cache = {}
 game_log_cache = {}
 processed_players = set()
 team_names_cache = {}
+roster_cache = {}
 
 # Manual mappings
 manual_mlb_mappings = {
@@ -85,7 +87,7 @@ class User(db.Model, UserMixin):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
-    password_hash = db.Column(db.String(256), nullable=False)  # Increased to 256
+    password_hash = db.Column(db.String(256), nullable=False)
     leagues = db.relationship('League', backref='user', lazy=True)
     contests = db.relationship('Contest', backref='user', lazy=True)
 
@@ -94,9 +96,9 @@ class League(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
     name = db.Column(db.String(100))
     espn_league_id = db.Column(db.Integer, nullable=False)
-    espn_s2 = db.Column(db.String(1024), nullable=False)  # Increased to 1024
-    swid = db.Column(db.String(1024), nullable=False)     # Increased to 1024
-    active_pitcher_slots = db.Column(db.Text, nullable=True)  # Store as JSON string
+    espn_s2 = db.Column(db.String(1024), nullable=False)
+    swid = db.Column(db.String(1024), nullable=False)
+    active_pitcher_slots = db.Column(db.Text, nullable=True)
     contests = db.relationship('Contest', backref='league', lazy=True)
 
     @property
@@ -150,7 +152,7 @@ login_manager.login_view = 'login'
 def load_user(user_id):
     return db.session.get(User, int(user_id))
 
-@cache.memoize(timeout=3600)
+@cache.memoize(timeout=86400)
 def get_mlb_id(player_name, player_id):
     logging.debug(f"Fetching MLB ID for player {player_name} (ESPN ID: {player_id})")
     if not player_name:
@@ -163,19 +165,23 @@ def get_mlb_id(player_name, player_id):
         return mlb_id_cache[player_id]
     encoded_name = urllib.parse.quote(player_name)
     search_url = f"{MLB_BASE_URL}/people/search?names={encoded_name}&sportId=1&active=true"
-    response = requests.get(search_url)
-    if response.status_code == 200:
-        data = response.json()
-        logging.debug(f"Found {len(data.get('people', []))} active player matches for {player_name}")
-        if data['people']:
-            mlb_id = data['people'][0]['id']
-            mlb_id_cache[player_id] = mlb_id
-            logging.debug(f"Stored MLB ID {mlb_id} for player {player_name}")
-            return mlb_id
+    try:
+        response = requests.get(search_url, timeout=5)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        logging.debug(f"MLB API error for player {player_name} (ID: {player_id}): {str(e)}")
+        return None
+    data = response.json()
+    logging.debug(f"Found {len(data.get('people', []))} active player matches for {player_name}")
+    if data['people']:
+        mlb_id = data['people'][0]['id']
+        mlb_id_cache[player_id] = mlb_id
+        logging.debug(f"Stored MLB ID {mlb_id} for player {player_name}")
+        return mlb_id
     logging.debug(f"No MLB ID found for player {player_name} (ESPN ID: {player_id})")
     return None
 
-@cache.memoize(timeout=3600)
+@cache.memoize(timeout=86400)
 def get_team_names(league_id, cookies):
     logging.debug(f"Fetching team names for league {league_id}")
     if league_id in team_names_cache:
@@ -184,7 +190,7 @@ def get_team_names(league_id, cookies):
     base_url = f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/flb/seasons/{YEAR}/segments/0/leagues/{league_id}"
     teams_url = f"{base_url}?view=mTeam"
     try:
-        response = requests.get(teams_url, headers=HEADERS, cookies=cookies)
+        response = requests.get(teams_url, headers=HEADERS, cookies=cookies, timeout=5)
         response.raise_for_status()
     except requests.RequestException as e:
         logging.error(f"API error fetching teams for league {league_id}: {str(e)}")
@@ -205,6 +211,36 @@ def get_team_names(league_id, cookies):
     logging.debug(f"Stored team names for league {league_id}")
     return team_names
 
+@cache.memoize(timeout=86400)
+def get_team_rosters(league_id, cookies, start_date, end_date, season_start):
+    logging.debug(f"Fetching rosters for league {league_id} from {start_date} to {end_date}")
+    cache_key = f"rosters_{league_id}_{start_date}_{end_date}"
+    if cache_key in roster_cache:
+        logging.debug(f"Cache hit for rosters: {cache_key}")
+        return roster_cache[cache_key]
+    
+    rosters = {}
+    current = start_date
+    while current <= end_date:
+        scoring_period = (current - season_start).days + 1
+        base_url = f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/flb/seasons/{YEAR}/segments/0/leagues/{league_id}"
+        roster_url = f"{base_url}?scoringPeriodId={scoring_period}&view=mRoster"
+        try:
+            response = requests.get(roster_url, headers=HEADERS, cookies=cookies, timeout=5)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            logging.debug(f"API error fetching roster for date {current}: {str(e)}")
+            rosters[current] = []
+            current += timedelta(days=1)
+            continue
+        roster_data = response.json()['teams']
+        rosters[current] = roster_data
+        current += timedelta(days=1)
+    
+    roster_cache[cache_key] = rosters
+    logging.debug(f"Stored rosters for {cache_key}")
+    return rosters
+
 def parse_ip(ip):
     try:
         ip_str = str(ip)
@@ -216,7 +252,7 @@ def parse_ip(ip):
         logging.warning(f"Error parsing innings pitched '{ip_str}': {str(e)}")
         return 0.0
 
-@cache.memoize(timeout=3600)
+@cache.memoize(timeout=86400)
 def compute_contest_stats(contest_id):
     logging.debug(f"Computing stats for contest {contest_id}")
     contest = db.session.get(Contest, contest_id)
@@ -256,7 +292,6 @@ def compute_contest_stats(contest_id):
         return rankings, chart_data, warning_message, status
     
     effective_end = min(end_date, today)
-    current = start_date
     no_data_days = []
     all_star_break = [date(2025, 7, 14), date(2025, 7, 15), date(2025, 7, 16), date(2025, 7, 17)]
     
@@ -264,12 +299,11 @@ def compute_contest_stats(contest_id):
     team_names = get_team_names(league.espn_league_id, cookies)
     
     team_stats = {team_name: {'num': 0.0, 'den': 0.0} if stat_category in ['OBP', 'AVG', 'SLUGGING PERCENTAGE', 'ERA', 'WHIP', 'K/BB'] else {'total': 0.0} for team_name in team_names.values()}
-    season_start = date(YEAR, 3, 18)  # Updated to March 18, 2025, based on MLB season start
+    season_start = date(YEAR, 3, 18)
     
-    # Load active pitcher slots from league settings
+    # Load active pitcher slots
     try:
         active_pitcher_slots = json.loads(league.active_pitcher_slots) if league.active_pitcher_slots else [13, 14, 15]
-        # Ensure only valid pitcher slots (P, SP, RP) are included
         active_pitcher_slots = [slot for slot in active_pitcher_slots if slot in [13, 14, 15]]
         if not active_pitcher_slots:
             logging.warning(f"No valid pitcher slots found for league {league.espn_league_id}, using default [13, 14, 15]")
@@ -279,43 +313,43 @@ def compute_contest_stats(contest_id):
         active_pitcher_slots = [13, 14, 15]
     logging.debug(f"Active pitcher slots for league {league.espn_league_id}: {active_pitcher_slots}")
     
-    # Test addition: Per-day HR tracking for June HR contest on team B. Hackenburg
+    # Test additions
     is_june_hr_test = (stat_category == 'HR' and contest.start_date == '2025-06-01' and contest.end_date == '2025-06-30')
     hr_per_day = defaultdict(list) if is_june_hr_test else None
-    # Test addition: Per-day RBI tracking for March, April, May, June, and July RBI contests on team B. Hackenburg
     is_march_rbi_test = (stat_category == 'RBI' and contest.start_date == '2025-03-18' and contest.end_date == '2025-03-31')
     is_april_rbi_test = (stat_category == 'RBI' and contest.start_date == '2025-04-01' and contest.end_date == '2025-04-30')
     is_may_rbi_test = (stat_category == 'RBI' and contest.start_date == '2025-05-01' and contest.end_date == '2025-05-31')
     is_june_rbi_test = (stat_category == 'RBI' and contest.start_date == '2025-06-01' and contest.end_date == '2025-06-30')
     is_july_rbi_test = (stat_category == 'RBI' and contest.start_date == '2025-07-01' and contest.end_date == '2025-07-31')
     rbi_per_day = defaultdict(list) if is_march_rbi_test or is_april_rbi_test or is_may_rbi_test or is_june_rbi_test or is_july_rbi_test else None
-    # Test addition: Per-day IP tracking for July Innings Pitched contest on team King Hoser
     is_july_ip_test = (stat_category == 'INNINGS PITCHED' and contest.start_date == '2025-07-01' and contest.end_date == '2025-07-31')
     ip_per_day = defaultdict(list) if is_july_ip_test else None
     
+    # Pre-fetch rosters for the entire period
+    rosters = get_team_rosters(league.espn_league_id, cookies, start_date, effective_end, season_start)
+    
+    current = start_date
     while current <= effective_end:
-        scoring_period = (current - season_start).days + 1
-        logging.debug(f"Processing scoring period {scoring_period} for date {current}")
+        date_str = current.strftime('%Y-%m-%d')
+        logging.debug(f"Processing scoring period {(current - season_start).days + 1} for date {current}")
         processed_players.clear()
         
-        base_url = f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/flb/seasons/{YEAR}/segments/0/leagues/{league.espn_league_id}"
-        roster_url = f"{base_url}?scoringPeriodId={scoring_period}&view=mRoster"
-        try:
-            roster_response = requests.get(roster_url, headers=HEADERS, cookies=cookies)
-            roster_response.raise_for_status()
-        except requests.RequestException as e:
-            logging.debug(f"API error fetching roster for date {current}: {str(e)}")
+        roster_data = rosters.get(current, [])
+        if not roster_data:
             if current not in all_star_break or stat_category not in pitching_categories:
                 no_data_days.append(current)
+            if is_july_ip_test:
+                ip_per_day[date_str] = []
+                logging.debug(f"No pitching stats for {date_str}, added empty IP entry for King Hoser")
             current += timedelta(days=1)
             continue
-        roster_data = roster_response.json()['teams']
         
         started_players = {}
+        daily_stats_found = False
         for team in roster_data:
             team_id = team['id']
             started = []
-            all_players = []  # Track all players for debugging
+            all_players = []
             for entry in team['roster']['entries']:
                 lineup_slot_id = entry['lineupSlotId']
                 player = entry.get('playerPoolEntry', {}).get('player', {})
@@ -344,9 +378,7 @@ def compute_contest_stats(contest_id):
             logging.debug(f"Team {team_names[team_id]} roster on {current}: {[(name, id, slot, status) for name, id, slot, status in all_players]}")
             logging.debug(f"Team {team_names[team_id]} has {len(started)} started players")
         
-        date_str = current.strftime('%Y-%m-%d')
         group = 'hitting' if stat_category in hitting_categories else 'pitching'
-        daily_stats_found = False
         for team_id, players in started_players.items():
             for player_id, player_name, lineup_slot_id in players:
                 if player_id not in mlb_id_cache:
@@ -368,7 +400,7 @@ def compute_contest_stats(contest_id):
                 if cache_key not in game_log_cache:
                     game_log_url = f"{MLB_BASE_URL}/people/{mlb_id}/stats?stats=gameLog&season={YEAR}&group={group}"
                     try:
-                        game_log_response = requests.get(game_log_url)
+                        game_log_response = requests.get(game_log_url, timeout=5)
                         game_log_response.raise_for_status()
                     except requests.RequestException as e:
                         logging.debug(f"MLB API error for player {player_name} (ID: {player_id}): {str(e)}")
@@ -524,11 +556,11 @@ def compute_contest_stats(contest_id):
         if not daily_stats_found and stat_category in pitching_categories and current not in all_star_break:
             no_data_days.append(current)
             if is_july_ip_test:
-                ip_per_day[date_str] = []  # Ensure empty list for days with no IP
+                ip_per_day[date_str] = []
                 logging.debug(f"No pitching stats for {date_str}, added empty IP entry for King Hoser")
         current += timedelta(days=1)
     
-    # Test addition: Log per-day HR details if it's the June HR test
+    # Test additions logging
     if is_june_hr_test:
         logging.info("June HR Test Results for Team B. Hackenburg (Daily Breakdown):")
         total_hr = 0
@@ -543,7 +575,6 @@ def compute_contest_stats(contest_id):
                 logging.info(f"Date {day}: Total HR 0, No HRs hit")
         logging.info(f"Overall Total HR for B. Hackenburg in June: {int(total_hr)}")
     
-    # Test addition: Log per-day RBI details if it's the March, April, May, June, or July RBI test
     if is_march_rbi_test or is_april_rbi_test or is_may_rbi_test or is_june_rbi_test or is_july_rbi_test:
         month = "March" if is_march_rbi_test else "April" if is_april_rbi_test else "May" if is_may_rbi_test else "June" if is_june_rbi_test else "July"
         logging.info(f"{month} RBI Test Results for Team B. Hackenburg (Daily Breakdown):")
@@ -559,12 +590,11 @@ def compute_contest_stats(contest_id):
                 logging.info(f"Date {day}: Total RBI 0, No RBIs")
         logging.info(f"Overall Total RBI for B. Hackenburg in {month}: {int(total_rbi)}")
     
-    # Test addition: Log per-day IP details if it's the July IP test
     if is_july_ip_test:
         logging.info("July IP Test Results for King Hoser (Daily Breakdown):")
         total_ip = 0.0
         current = start_date
-        while current <= end_date:  # Ensure all days are logged
+        while current <= end_date:
             day_str = current.strftime('%Y-%m-%d')
             daily_ip = ip_per_day.get(day_str, [])
             if daily_ip:
@@ -619,7 +649,6 @@ def compute_contest_stats(contest_id):
     else:
         status['is_complete'] = True
         status['days_remaining'] = None
-        # Find all teams tied for the top score
         if rankings:
             top_score = rankings[0][1]
             winners = [team for team, value in rankings if value == top_score]
@@ -721,13 +750,14 @@ def link_league():
         swid = form.swid.data
         cookies = {'espn_s2': espn_s2, 'swid': swid}
         settings_url = f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/flb/seasons/{YEAR}/segments/0/leagues/{espn_league_id}?view=mSettings"
-        response = requests.get(settings_url, headers=HEADERS, cookies=cookies)
-        if response.status_code != 200:
+        try:
+            response = requests.get(settings_url, headers=HEADERS, cookies=cookies, timeout=5)
+            response.raise_for_status()
+        except requests.RequestException:
             flash("Invalid league details or credentials. Please check and try again.")
             return render_template('link_league.html', form=form)
         data = response.json()
         league_name = data.get('settings', {}).get('name', f'League {espn_league_id}')
-        # Fetch active pitcher slots from lineupSlotCounts where count > 0 and slot is pitcher
         lineupSlotCounts = data.get('settings', {}).get('rosterSettings', {}).get('lineupSlotCounts', {})
         logging.debug(f"Raw lineupSlotCounts for league {espn_league_id}: {lineupSlotCounts}")
         active_pitcher_slots = [int(k) for k, v in lineupSlotCounts.items() if 13 <= int(k) <= 15 and v > 0]
@@ -793,7 +823,7 @@ def create_contest():
         
         return redirect(url_for('results', contest_id=contest.id))
     today = date.today()
-    return render_template('create_contest.html', form=form, current_date=date.today().strftime('%Y-%m-%d'), start_of_month=date.today().replace(day=1).strftime('%Y-%m-%d'), leagues=current_user.leagues)
+    return render_template('create_contest.html', form=form, current_date=today.strftime('%Y-%m-%d'), start_of_month=date.today().replace(day=1).strftime('%Y-%m-%d'), leagues=current_user.leagues)
 
 @app.route('/dashboard', methods=['GET', 'POST'])
 @login_required
@@ -867,7 +897,6 @@ def my_leagues():
     forms = [DeleteLeagueForm(prefix=str(league.id), league_id=league.id) for league in leagues]
     if request.method == 'POST':
         logging.debug(f"Received POST request to /my-leagues with form data: {request.form}")
-        # Find which form was submitted (using prefix)
         for form in forms:
             if form.validate_on_submit():
                 logging.debug(f"Form validated successfully, league_id: {form.league_id.data}")
@@ -892,13 +921,13 @@ def my_leagues():
                 except Exception as e:
                     logging.error(f"Error deleting league: {str(e)}")
                     flash(f"Error deleting league: {str(e)}", "error")
-                break  # Stop after processing the submitted form
+                break
         else:
             logging.warning(f"Form validation failed for all forms: {[f.errors for f in forms]}")
             flash("Form validation failed.", "error")
         return redirect(url_for('my_leagues'))
     
-    leagues_forms = list(zip(leagues, forms))  # Convert zip to list
+    leagues_forms = list(zip(leagues, forms))
     logging.debug(f"Rendering my_leagues.html with {len(leagues)} leagues")
     return render_template('my_leagues.html', leagues_forms=leagues_forms)
 
