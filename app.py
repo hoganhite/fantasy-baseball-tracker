@@ -94,8 +94,8 @@ class League(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
     name = db.Column(db.String(100))
     espn_league_id = db.Column(db.Integer, nullable=False)
-    espn_s2 = db.Column(db.String(512), nullable=False)  # Increased to 512
-    swid = db.Column(db.String(512), nullable=False)     # Increased to 512
+    espn_s2 = db.Column(db.String(1024), nullable=False)  # Increased to 1024
+    swid = db.Column(db.String(1024), nullable=False)     # Increased to 1024
     active_pitcher_slots = db.Column(db.Text, nullable=True)  # Store as JSON string
     contests = db.relationship('Contest', backref='league', lazy=True)
 
@@ -793,7 +793,7 @@ def create_contest():
         
         return redirect(url_for('results', contest_id=contest.id))
     today = date.today()
-    return render_template('create_contest.html', form=form, current_date=today.strftime('%Y-%m-%d'), start_of_month=date.today().replace(day=1).strftime('%Y-%m-%d'), leagues=current_user.leagues)
+    return render_template('create_contest.html', form=form, current_date=date.today().strftime('%Y-%m-%d'), start_of_month=date.today().replace(day=1).strftime('%Y-%m-%d'), leagues=current_user.leagues)
 
 @app.route('/dashboard', methods=['GET', 'POST'])
 @login_required
