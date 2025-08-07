@@ -21,7 +21,7 @@ import requests.exceptions
 load_dotenv()
 YEAR = int(os.getenv('YEAR', datetime.now().year))
 app = Flask(__name__)
-app.secret_key = os.getenv('SECRET_KEY')  # Must be set in .env for production
+app.secret_key = os.getenv('SECRET_KEY')
 if not app.secret_key:
     raise ValueError("No SECRET_KEY set in environment variables")
 
@@ -44,18 +44,18 @@ else:
             f.write(encryption_key)
 ENCRYPTION_KEY = base64.urlsafe_b64encode(encryption_key)
 
-# Configure database (PostgreSQL for production, SQLite for local testing)
+# Configure database
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', f'sqlite:///{os.path.join(app.instance_path, "database.db")}')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SESSION_COOKIE_SECURE'] = True  # Ensure cookies are sent over HTTPS
-app.config['SESSION_COOKIE_HTTPONLY'] = True  # Prevent JavaScript access to cookies
-app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'  # Protect against CSRF
+app.config['SESSION_COOKIE_SECURE'] = True
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 db = SQLAlchemy(app)
 
-# Configure Flask-Caching with FileSystemCache
+# Configure Flask-Caching
 app.config['CACHE_TYPE'] = 'FileSystemCache'
 app.config['CACHE_DIR'] = cache_dir
-app.config['CACHE_DEFAULT_TIMEOUT'] = 86400  # 1 day for longer caching
+app.config['CACHE_DEFAULT_TIMEOUT'] = 86400
 cache = Cache(app)
 
 # Logging setup
@@ -139,6 +139,16 @@ class ContestResult(db.Model):
     status = db.Column(db.Text, nullable=False)
     last_updated = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
 
+class PlayerCache(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    espn_id = db.Column(db.Integer, nullable=False, unique=True)
+    mlb_id = db.Column(db.Integer, nullable=True)
+    player_name = db.Column(db.String(100), nullable=False)
+    game_log = db.Column(db.Text, nullable=True)
+    season = db.Column(db.Integer, nullable=False)
+    group = db.Column(db.String(20), nullable=False)
+    last_updated = db.Column(db.DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+
 # Initialize database
 with app.app_context():
     db.create_all()
@@ -160,9 +170,14 @@ def get_mlb_id(player_name, player_id):
     if player_id in manual_mlb_mappings:
         logging.debug(f"Using manual mapping for player ID {player_id}: {manual_mlb_mappings[player_id]}")
         return manual_mlb_mappings[player_id]
-    if player_id in mlb_id_cache:
-        logging.debug(f"Cache hit for MLB ID: {mlb_id_cache[player_id]}")
-        return mlb_id_cache[player_id]
+    
+    # Check database cache
+    player_cache = PlayerCache.query.filter_by(espn_id=player_id, season=YEAR).first()
+    if player_cache and player_cache.mlb_id:
+        logging.debug(f"Database cache hit for MLB ID: {player_cache.mlb_id}")
+        return player_cache.mlb_id
+    
+    # Fetch from API
     encoded_name = urllib.parse.quote(player_name)
     search_url = f"{MLB_BASE_URL}/people/search?names={encoded_name}&sportId=1&active=true"
     try:
@@ -175,7 +190,25 @@ def get_mlb_id(player_name, player_id):
     logging.debug(f"Found {len(data.get('people', []))} active player matches for {player_name}")
     if data['people']:
         mlb_id = data['people'][0]['id']
-        mlb_id_cache[player_id] = mlb_id
+        # Store in database
+        player_cache = PlayerCache.query.filter_by(espn_id=player_id, season=YEAR).first()
+        if player_cache:
+            player_cache.mlb_id = mlb_id
+            player_cache.last_updated = datetime.now(timezone.utc)
+        else:
+            player_cache = PlayerCache(
+                espn_id=player_id,
+                player_name=player_name,
+                mlb_id=mlb_id,
+                season=YEAR,
+                group='hitting'  # Default, updated later if needed
+            )
+            db.session.add(player_cache)
+        try:
+            db.session.commit()
+        except Exception as e:
+            logging.error(f"Database error storing MLB ID for {player_name}: {str(e)}")
+            db.session.rollback()
         logging.debug(f"Stored MLB ID {mlb_id} for player {player_name}")
         return mlb_id
     logging.debug(f"No MLB ID found for player {player_name} (ESPN ID: {player_id})")
@@ -301,7 +334,6 @@ def compute_contest_stats(contest_id):
     team_stats = {team_name: {'num': 0.0, 'den': 0.0} if stat_category in ['OBP', 'AVG', 'SLUGGING PERCENTAGE', 'ERA', 'WHIP', 'K/BB'] else {'total': 0.0} for team_name in team_names.values()}
     season_start = date(YEAR, 3, 18)
     
-    # Load active pitcher slots
     try:
         active_pitcher_slots = json.loads(league.active_pitcher_slots) if league.active_pitcher_slots else [13, 14, 15]
         active_pitcher_slots = [slot for slot in active_pitcher_slots if slot in [13, 14, 15]]
@@ -325,240 +357,268 @@ def compute_contest_stats(contest_id):
     is_july_ip_test = (stat_category == 'INNINGS PITCHED' and contest.start_date == '2025-07-01' and contest.end_date == '2025-07-31')
     ip_per_day = defaultdict(list) if is_july_ip_test else None
     
-    # Pre-fetch rosters for the entire period
-    rosters = get_team_rosters(league.espn_league_id, cookies, start_date, effective_end, season_start)
-    
+    # Process in weekly chunks
+    chunk_size = 7  # Process 7 days at a time
     current = start_date
     while current <= effective_end:
-        date_str = current.strftime('%Y-%m-%d')
-        logging.debug(f"Processing scoring period {(current - season_start).days + 1} for date {current}")
-        processed_players.clear()
+        chunk_end = min(current + timedelta(days=chunk_size - 1), effective_end)
+        logging.debug(f"Processing chunk from {current} to {chunk_end}")
+        rosters = get_team_rosters(league.espn_league_id, cookies, current, chunk_end, season_start)
         
-        roster_data = rosters.get(current, [])
-        if not roster_data:
-            if current not in all_star_break or stat_category not in pitching_categories:
-                no_data_days.append(current)
-            if is_july_ip_test:
-                ip_per_day[date_str] = []
-                logging.debug(f"No pitching stats for {date_str}, added empty IP entry for King Hoser")
-            current += timedelta(days=1)
-            continue
-        
-        started_players = {}
-        daily_stats_found = False
-        for team in roster_data:
-            team_id = team['id']
-            started = []
-            all_players = []
-            for entry in team['roster']['entries']:
-                lineup_slot_id = entry['lineupSlotId']
-                player = entry.get('playerPoolEntry', {}).get('player', {})
-                player_name = player.get('fullName')
-                player_id = entry['playerId']
-                eligible_slots = player.get('eligibleSlots', [])
-                default_position_id = player.get('defaultPositionId', -1)
-                slot_status = "Active" if lineup_slot_id in active_pitcher_slots else "Bench" if lineup_slot_id == 16 else "Other"
-                logging.debug(f"Roster entry for team {team_names[team_id]}: player={player_name}, ID={player_id}, slot={lineup_slot_id}, status={slot_status}, eligible_slots={eligible_slots}, defaultPositionId={default_position_id}")
-                all_players.append((player_name, player_id, lineup_slot_id, slot_status))
-                if not player_name:
-                    logging.debug(f"Skipping entry with no player name for team {team_names[team_id]}, ID={player_id}, slot={lineup_slot_id}")
-                    continue
-                if stat_category in hitting_categories:
-                    if lineup_slot_id <= 12:
-                        started.append((player_id, player_name, lineup_slot_id))
-                elif stat_category in pitching_categories:
-                    if lineup_slot_id in active_pitcher_slots:
-                        started.append((player_id, player_name, lineup_slot_id))
-                    else:
-                        logging.debug(f"Skipping {player_name} (ID: {player_id}) in slot {lineup_slot_id} as they are not in an active pitcher slot")
+        chunk_date = current
+        while chunk_date <= chunk_end:
+            date_str = chunk_date.strftime('%Y-%m-%d')
+            logging.debug(f"Processing scoring period {(chunk_date - season_start).days + 1} for date {chunk_date}")
+            processed_players.clear()
+            
+            roster_data = rosters.get(chunk_date, [])
+            if not roster_data:
+                if chunk_date not in all_star_break or stat_category not in pitching_categories:
+                    no_data_days.append(chunk_date)
+                if is_july_ip_test:
+                    ip_per_day[date_str] = []
+                    logging.debug(f"No pitching stats for {date_str}, added empty IP entry for King Hoser")
+                chunk_date += timedelta(days=1)
+                continue
+            
+            started_players = {}
+            daily_stats_found = False
+            for team in roster_data:
+                team_id = team['id']
+                started = []
+                all_players = []
+                for entry in team['roster']['entries']:
+                    lineup_slot_id = entry['lineupSlotId']
+                    player = entry.get('playerPoolEntry', {}).get('player', {})
+                    player_name = player.get('fullName')
+                    player_id = entry['playerId']
+                    eligible_slots = player.get('eligibleSlots', [])
+                    default_position_id = player.get('defaultPositionId', -1)
+                    slot_status = "Active" if lineup_slot_id in active_pitcher_slots else "Bench" if lineup_slot_id == 16 else "Other"
+                    logging.debug(f"Roster entry for team {team_names[team_id]}: player={player_name}, ID={player_id}, slot={lineup_slot_id}, status={slot_status}, eligible_slots={eligible_slots}, defaultPositionId={default_position_id}")
+                    all_players.append((player_name, player_id, lineup_slot_id, slot_status))
+                    if not player_name:
+                        logging.debug(f"Skipping entry with no player name for team {team_names[team_id]}, ID={player_id}, slot={lineup_slot_id}")
                         continue
-                else:
-                    logging.debug(f"Invalid stat_category for player {player_name}: {stat_category}")
-            started_players[team_id] = started
-            logging.debug(f"Team {team_names[team_id]} roster on {current}: {[(name, id, slot, status) for name, id, slot, status in all_players]}")
-            logging.debug(f"Team {team_names[team_id]} has {len(started)} started players")
-        
-        group = 'hitting' if stat_category in hitting_categories else 'pitching'
-        for team_id, players in started_players.items():
-            for player_id, player_name, lineup_slot_id in players:
-                if player_id not in mlb_id_cache:
-                    mlb_id = get_mlb_id(player_name, player_id)
-                    if mlb_id:
-                        mlb_id_cache[player_id] = mlb_id
-                    else:
-                        logging.warning(f"No MLB ID for player {player_name} (ESPN ID: {player_id})")
-                        continue
-                mlb_id = mlb_id_cache.get(player_id)
-                if not mlb_id:
-                    logging.warning(f"Skipped player {player_name} (ESPN ID: {player_id}) for team {team_names[team_id]} on {date_str} due to no MLB ID")
-                    continue
-                if mlb_id in processed_players:
-                    continue
-                processed_players.add(mlb_id)
-                
-                cache_key = f"game_log_{player_id}_{YEAR}_{group}"
-                if cache_key not in game_log_cache:
-                    game_log_url = f"{MLB_BASE_URL}/people/{mlb_id}/stats?stats=gameLog&season={YEAR}&group={group}"
-                    try:
-                        game_log_response = requests.get(game_log_url, timeout=5)
-                        game_log_response.raise_for_status()
-                    except requests.RequestException as e:
-                        logging.debug(f"MLB API error for player {player_name} (ID: {player_id}): {str(e)}")
-                        continue
-                    game_log_data = game_log_response.json()
-                    try:
-                        game_log = game_log_data['stats'][0]['splits']
-                        game_log_cache[cache_key] = game_log
-                        logging.debug(f"Stored game log for player {player_name} (cache key: {cache_key})")
-                    except (KeyError, IndexError) as e:
-                        logging.debug(f"No game log structure for player {player_name} (ESPN ID: {player_id}, MLB ID: {mlb_id})")
-                        continue
-                game_log = game_log_cache.get(cache_key, [])
-                daily_stats_list = [s['stat'] for s in game_log if s.get('date') == date_str]
-                if len(daily_stats_list) > 1:
-                    logging.warning(f"Multiple game entries found for player {player_name} (MLB ID: {mlb_id}) on {date_str}: {len(daily_stats_list)} games")
-                    logging.debug(f"Doubleheader detected for player {player_name} on {date_str}")
-                if not daily_stats_list:
-                    logging.debug(f"No stats for player {player_name} on {date_str}")
-                    continue
-                daily_stats_found = True
-                
-                aggregated_stats = {}
-                for stat_dict in daily_stats_list:
-                    for key, value in stat_dict.items():
-                        if key == 'inningsPitched':
-                            ip_value = parse_ip(value)
-                            aggregated_stats[key] = aggregated_stats.get(key, 0.0) + ip_value
-                            logging.debug(f"Parsed IP for {player_name} on {date_str}: raw={value}, parsed={ip_value}")
+                    if stat_category in hitting_categories:
+                        if lineup_slot_id <= 12:
+                            started.append((player_id, player_name, lineup_slot_id))
+                    elif stat_category in pitching_categories:
+                        if lineup_slot_id in active_pitcher_slots:
+                            started.append((player_id, player_name, lineup_slot_id))
                         else:
-                            try:
-                                aggregated_stats[key] = aggregated_stats.get(key, 0.0) + float(value)
-                            except (ValueError, TypeError):
-                                if key == 'homeRuns' and isinstance(value, str) and 'HR' in value:
-                                    hr_count = 1 if 'HR' in value else 0
-                                    aggregated_stats[key] = aggregated_stats.get(key, 0.0) + hr_count
-                                    logging.debug(f"Parsed HR from string '{value}' for {player_name} on {date_str}: {hr_count}")
-                                elif key == 'rbi' and isinstance(value, str) and 'RBI' in value:
-                                    rbi_count = 1 if 'RBI' in value else 0
-                                    aggregated_stats[key] = aggregated_stats.get(key, 0.0) + rbi_count
-                                    logging.debug(f"Parsed RBI from string '{value}' for {player_name} on {date_str}: {rbi_count}")
-                                else:
-                                    logging.warning(f"Invalid stat value for {key}='{value}' for player {player_name} on {date_str}, skipping")
-                                    aggregated_stats[key] = aggregated_stats.get(key, 0.0)
-                
-                logging.debug(f"Aggregated daily stats for player ID {player_id} (MLB ID: {mlb_id}) on {date_str}: {aggregated_stats}")
-                if stat_category == 'OBP':
-                    h = aggregated_stats.get('hits', 0)
-                    bb = aggregated_stats.get('baseOnBalls', 0)
-                    hbp = aggregated_stats.get('hitByPitch', 0)
-                    ab = aggregated_stats.get('atBats', 0)
-                    sf = aggregated_stats.get('sacFlies', 0)
-                    pa = ab + bb + hbp + sf
-                    if pa > 0:
-                        if h > ab:
-                            logging.warning(f"Invalid stats for player ID {player_id}: Hits ({h}) > At Bats ({ab})")
+                            logging.debug(f"Skipping {player_name} (ID: {player_id}) in slot {lineup_slot_id} as they are not in an active pitcher slot")
                             continue
-                        team_stats[team_names[team_id]]['num'] += h + bb + hbp
-                        team_stats[team_names[team_id]]['den'] += pa
-                elif stat_category == 'AVG':
-                    h = aggregated_stats.get('hits', 0)
-                    bb = aggregated_stats.get('baseOnBalls', 0)
-                    hbp = aggregated_stats.get('hitByPitch', 0)
-                    ab = aggregated_stats.get('atBats', 0)
-                    sf = aggregated_stats.get('sacFlies', 0)
-                    pa = ab + bb + hbp + sf
-                    if pa > 0:
-                        if h > ab:
-                            logging.warning(f"Invalid stats for player ID {player_id}: Hits ({h}) > At Bats ({ab})")
+                    else:
+                        logging.debug(f"Invalid stat_category for player {player_name}: {stat_category}")
+                started_players[team_id] = started
+                logging.debug(f"Team {team_names[team_id]} roster on {chunk_date}: {[(name, id, slot, status) for name, id, slot, status in all_players]}")
+                logging.debug(f"Team {team_names[team_id]} has {len(started)} started players")
+            
+            group = 'hitting' if stat_category in hitting_categories else 'pitching'
+            for team_id, players in started_players.items():
+                for player_id, player_name, lineup_slot_id in players:
+                    if player_id not in mlb_id_cache:
+                        mlb_id = get_mlb_id(player_name, player_id)
+                        if mlb_id:
+                            mlb_id_cache[player_id] = mlb_id
+                        else:
+                            logging.warning(f"No MLB ID for player {player_name} (ESPN ID: {player_id})")
                             continue
-                        team_stats[team_names[team_id]]['num'] += h
-                        team_stats[team_names[team_id]]['den'] += ab
-                elif stat_category == 'HR':
-                    hr = aggregated_stats.get('homeRuns', 0)
-                    team_stats[team_names[team_id]]['total'] += hr
-                    if is_june_hr_test and team_names[team_id] == "B. Hackenburg" and hr > 0:
-                        hr_per_day[date_str].append((player_name, hr))
-                        logging.debug(f"Adding {hr} HR for player {player_name} (ESPN ID: {player_id}, MLB ID: {mlb_id}) on {date_str} to team B. Hackenburg")
-                elif stat_category == 'RBI':
-                    rbi = aggregated_stats.get('rbi', 0)
-                    team_stats[team_names[team_id]]['total'] += rbi
-                    if (is_march_rbi_test or is_april_rbi_test or is_may_rbi_test or is_june_rbi_test or is_july_rbi_test) and team_names[team_id] == "B. Hackenburg" and rbi > 0:
-                        rbi_per_day[date_str].append((player_name, rbi))
-                        logging.debug(f"Adding {rbi} RBI for player {player_name} (ESPN ID: {player_id}, MLB ID: {mlb_id}) on {date_str} to team B. Hackenburg")
-                elif stat_category == 'HITS':
-                    team_stats[team_names[team_id]]['total'] += aggregated_stats.get('hits', 0)
-                elif stat_category == 'RUNS SCORED':
-                    team_stats[team_names[team_id]]['total'] += aggregated_stats.get('runs', 0)
-                elif stat_category == 'WALKS':
-                    team_stats[team_names[team_id]]['total'] += aggregated_stats.get('baseOnBalls', 0)
-                elif stat_category == 'STOLEN BASES':
-                    team_stats[team_names[team_id]]['total'] += aggregated_stats.get('stolenBases', 0)
-                elif stat_category == 'SLUGGING PERCENTAGE':
-                    total_bases = aggregated_stats.get('totalBases', 0)
-                    bb = aggregated_stats.get('baseOnBalls', 0)
-                    hbp = aggregated_stats.get('hitByPitch', 0)
-                    ab = aggregated_stats.get('atBats', 0)
-                    sf = aggregated_stats.get('sacFlies', 0)
-                    pa = ab + bb + hbp + sf
-                    if pa > 0:
-                        if total_bases > 4 * ab:
-                            logging.warning(f"Invalid stats for player ID {player_id}: Total Bases ({total_bases}) > 4 * At Bats ({ab})")
-                            continue
-                        team_stats[team_names[team_id]]['num'] += total_bases
-                        team_stats[team_names[team_id]]['den'] += ab
-                elif stat_category == 'INNINGS PITCHED':
-                    ip = aggregated_stats.get('inningsPitched', 0)
-                    if lineup_slot_id not in active_pitcher_slots:
-                        logging.warning(f"Player {player_name} (ID: {player_id}) in slot {lineup_slot_id} is not active but has {ip} IP on {date_str}, skipping")
+                    mlb_id = mlb_id_cache.get(player_id)
+                    if not mlb_id:
+                        logging.warning(f"Skipped player {player_name} (ESPN ID: {player_id}) for team {team_names[team_id]} on {date_str} due to no MLB ID")
                         continue
-                    team_stats[team_names[team_id]]['total'] += ip
-                    if is_july_ip_test and team_names[team_id] == "King Hoser" and ip > 0:
-                        ip_per_day[date_str].append((player_name, ip, lineup_slot_id))
-                        logging.debug(f"Adding {ip} IP for player {player_name} (ESPN ID: {player_id}, MLB ID: {mlb_id}) on {date_str} to team King Hoser in slot {lineup_slot_id}")
-                elif stat_category == 'HITS ALLOWED':
-                    team_stats[team_names[team_id]]['total'] += aggregated_stats.get('hits', 0)
-                elif stat_category == 'ERA':
-                    er = aggregated_stats.get('earnedRuns', 0)
-                    ip = aggregated_stats.get('inningsPitched', 0)
-                    if ip > 0:
-                        if er < 0:
-                            logging.warning(f"Invalid stats for player ID {player_id}: Earned Runs ({er}) < 0")
+                    if mlb_id in processed_players:
+                        continue
+                    processed_players.add(mlb_id)
+                    
+                    cache_key = f"game_log_{player_id}_{YEAR}_{group}"
+                    player_cache = PlayerCache.query.filter_by(espn_id=player_id, season=YEAR, group=group).first()
+                    if player_cache and player_cache.game_log:
+                        game_log = json.loads(player_cache.game_log)
+                        logging.debug(f"Database cache hit for game log: {cache_key}")
+                    else:
+                        game_log_url = f"{MLB_BASE_URL}/people/{mlb_id}/stats?stats=gameLog&season={YEAR}&group={group}"
+                        try:
+                            game_log_response = requests.get(game_log_url, timeout=5)
+                            game_log_response.raise_for_status()
+                        except requests.RequestException as e:
+                            logging.debug(f"MLB API error for player {player_name} (ID: {player_id}): {str(e)}")
                             continue
-                        team_stats[team_names[team_id]]['num'] += er * 9
-                        team_stats[team_names[team_id]]['den'] += ip
-                elif stat_category == 'WALKS ALLOWED':
-                    team_stats[team_names[team_id]]['total'] += aggregated_stats.get('baseOnBalls', 0)
-                elif stat_category == 'STRIKEOUTS':
-                    team_stats[team_names[team_id]]['total'] += aggregated_stats.get('strikeOuts', 0)
-                elif stat_category == 'QUALITY STARTS':
-                    team_stats[team_names[team_id]]['total'] += aggregated_stats.get('qualityStarts', 0)
-                elif stat_category == 'WINS':
-                    team_stats[team_names[team_id]]['total'] += aggregated_stats.get('wins', 0)
-                elif stat_category == 'SAVES':
-                    team_stats[team_names[team_id]]['total'] += aggregated_stats.get('saves', 0)
-                elif stat_category == 'SAVES + HOLDS':
-                    team_stats[team_names[team_id]]['total'] += aggregated_stats.get('saves', 0) + aggregated_stats.get('holds', 0)
-                elif stat_category == 'WHIP':
-                    hits = aggregated_stats.get('hits', 0)
-                    bb = aggregated_stats.get('baseOnBalls', 0)
-                    ip = aggregated_stats.get('inningsPitched', 0)
-                    if ip > 0:
-                        if hits < 0 or bb < 0:
-                            logging.warning(f"Invalid stats for player ID {player_id}: Hits ({hits}) or Walks ({bb}) < 0")
+                        game_log_data = game_log_response.json()
+                        try:
+                            game_log = game_log_data['stats'][0]['splits']
+                            game_log_cache[cache_key] = game_log
+                            if player_cache:
+                                player_cache.game_log = json.dumps(game_log)
+                                player_cache.last_updated = datetime.now(timezone.utc)
+                            else:
+                                player_cache = PlayerCache(
+                                    espn_id=player_id,
+                                    player_name=player_name,
+                                    mlb_id=mlb_id,
+                                    season=YEAR,
+                                    group=group,
+                                    game_log=json.dumps(game_log)
+                                )
+                                db.session.add(player_cache)
+                            try:
+                                db.session.commit()
+                            except Exception as e:
+                                logging.error(f"Database error storing game log for {player_name}: {str(e)}")
+                                db.session.rollback()
+                            logging.debug(f"Stored game log for player {player_name} (cache key: {cache_key})")
+                        except (KeyError, IndexError) as e:
+                            logging.debug(f"No game log structure for player {player_name} (ESPN ID: {player_id}, MLB ID: {mlb_id})")
                             continue
-                        team_stats[team_names[team_id]]['num'] += hits + bb
-                        team_stats[team_names[team_id]]['den'] += ip
-                elif stat_category == 'K/BB':
-                    k = aggregated_stats.get('strikeOuts', 0)
-                    bb = aggregated_stats.get('baseOnBalls', 0)
-                    team_stats[team_names[team_id]]['num'] += k
-                    team_stats[team_names[team_id]]['den'] += bb
-        if not daily_stats_found and stat_category in pitching_categories and current not in all_star_break:
-            no_data_days.append(current)
-            if is_july_ip_test:
-                ip_per_day[date_str] = []
-                logging.debug(f"No pitching stats for {date_str}, added empty IP entry for King Hoser")
-        current += timedelta(days=1)
+                    game_log = game_log_cache.get(cache_key, game_log)
+                    daily_stats_list = [s['stat'] for s in game_log if s.get('date') == date_str]
+                    if len(daily_stats_list) > 1:
+                        logging.warning(f"Multiple game entries found for player {player_name} (MLB ID: {mlb_id}) on {date_str}: {len(daily_stats_list)} games")
+                        logging.debug(f"Doubleheader detected for player {player_name} on {date_str}")
+                    if not daily_stats_list:
+                        logging.debug(f"No stats for player {player_name} on {date_str}")
+                        continue
+                    daily_stats_found = True
+                    
+                    aggregated_stats = {}
+                    for stat_dict in daily_stats_list:
+                        for key, value in stat_dict.items():
+                            if key == 'inningsPitched':
+                                ip_value = parse_ip(value)
+                                aggregated_stats[key] = aggregated_stats.get(key, 0.0) + ip_value
+                                logging.debug(f"Parsed IP for {player_name} on {date_str}: raw={value}, parsed={ip_value}")
+                            else:
+                                try:
+                                    aggregated_stats[key] = aggregated_stats.get(key, 0.0) + float(value)
+                                except (ValueError, TypeError):
+                                    if key == 'homeRuns' and isinstance(value, str) and 'HR' in value:
+                                        hr_count = 1 if 'HR' in value else 0
+                                        aggregated_stats[key] = aggregated_stats.get(key, 0.0) + hr_count
+                                        logging.debug(f"Parsed HR from string '{value}' for {player_name} on {date_str}: {hr_count}")
+                                    elif key == 'rbi' and isinstance(value, str) and 'RBI' in value:
+                                        rbi_count = 1 if 'RBI' in value else 0
+                                        aggregated_stats[key] = aggregated_stats.get(key, 0.0) + rbi_count
+                                        logging.debug(f"Parsed RBI from string '{value}' for {player_name} on {date_str}: {rbi_count}")
+                                    else:
+                                        logging.warning(f"Invalid stat value for {key}='{value}' for player {player_name} on {date_str}, skipping")
+                                        aggregated_stats[key] = aggregated_stats.get(key, 0.0)
+                    
+                    logging.debug(f"Aggregated daily stats for player ID {player_id} (MLB ID: {mlb_id}) on {date_str}: {aggregated_stats}")
+                    if stat_category == 'OBP':
+                        h = aggregated_stats.get('hits', 0)
+                        bb = aggregated_stats.get('baseOnBalls', 0)
+                        hbp = aggregated_stats.get('hitByPitch', 0)
+                        ab = aggregated_stats.get('atBats', 0)
+                        sf = aggregated_stats.get('sacFlies', 0)
+                        pa = ab + bb + hbp + sf
+                        if pa > 0:
+                            if h > ab:
+                                logging.warning(f"Invalid stats for player ID {player_id}: Hits ({h}) > At Bats ({ab})")
+                                continue
+                            team_stats[team_names[team_id]]['num'] += h + bb + hbp
+                            team_stats[team_names[team_id]]['den'] += pa
+                    elif stat_category == 'AVG':
+                        h = aggregated_stats.get('hits', 0)
+                        bb = aggregated_stats.get('baseOnBalls', 0)
+                        hbp = aggregated_stats.get('hitByPitch', 0)
+                        ab = aggregated_stats.get('atBats', 0)
+                        sf = aggregated_stats.get('sacFlies', 0)
+                        pa = ab + bb + hbp + sf
+                        if pa > 0:
+                            if h > ab:
+                                logging.warning(f"Invalid stats for player ID {player_id}: Hits ({h}) > At Bats ({ab})")
+                                continue
+                            team_stats[team_names[team_id]]['num'] += h
+                            team_stats[team_names[team_id]]['den'] += ab
+                    elif stat_category == 'HR':
+                        hr = aggregated_stats.get('homeRuns', 0)
+                        team_stats[team_names[team_id]]['total'] += hr
+                        if is_june_hr_test and team_names[team_id] == "B. Hackenburg" and hr > 0:
+                            hr_per_day[date_str].append((player_name, hr))
+                            logging.debug(f"Adding {hr} HR for player {player_name} (ESPN ID: {player_id}, MLB ID: {mlb_id}) on {date_str} to team B. Hackenburg")
+                    elif stat_category == 'RBI':
+                        rbi = aggregated_stats.get('rbi', 0)
+                        team_stats[team_names[team_id]]['total'] += rbi
+                        if (is_march_rbi_test or is_april_rbi_test or is_may_rbi_test or is_june_rbi_test or is_july_rbi_test) and team_names[team_id] == "B. Hackenburg" and rbi > 0:
+                            rbi_per_day[date_str].append((player_name, rbi))
+                            logging.debug(f"Adding {rbi} RBI for player {player_name} (ESPN ID: {player_id}, MLB ID: {mlb_id}) on {date_str} to team B. Hackenburg")
+                    elif stat_category == 'HITS':
+                        team_stats[team_names[team_id]]['total'] += aggregated_stats.get('hits', 0)
+                    elif stat_category == 'RUNS SCORED':
+                        team_stats[team_names[team_id]]['total'] += aggregated_stats.get('runs', 0)
+                    elif stat_category == 'WALKS':
+                        team_stats[team_names[team_id]]['total'] += aggregated_stats.get('baseOnBalls', 0)
+                    elif stat_category == 'STOLEN BASES':
+                        team_stats[team_names[team_id]]['total'] += aggregated_stats.get('stolenBases', 0)
+                    elif stat_category == 'SLUGGING PERCENTAGE':
+                        total_bases = aggregated_stats.get('totalBases', 0)
+                        bb = aggregated_stats.get('baseOnBalls', 0)
+                        hbp = aggregated_stats.get('hitByPitch', 0)
+                        ab = aggregated_stats.get('atBats', 0)
+                        sf = aggregated_stats.get('sacFlies', 0)
+                        pa = ab + bb + hbp + sf
+                        if pa > 0:
+                            if total_bases > 4 * ab:
+                                logging.warning(f"Invalid stats for player ID {player_id}: Total Bases ({total_bases}) > 4 * At Bats ({ab})")
+                                continue
+                            team_stats[team_names[team_id]]['num'] += total_bases
+                            team_stats[team_names[team_id]]['den'] += ab
+                    elif stat_category == 'INNINGS PITCHED':
+                        ip = aggregated_stats.get('inningsPitched', 0)
+                        if lineup_slot_id not in active_pitcher_slots:
+                            logging.warning(f"Player {player_name} (ID: {player_id}) in slot {lineup_slot_id} is not active but has {ip} IP on {date_str}, skipping")
+                            continue
+                        team_stats[team_names[team_id]]['total'] += ip
+                        if is_july_ip_test and team_names[team_id] == "King Hoser" and ip > 0:
+                            ip_per_day[date_str].append((player_name, ip, lineup_slot_id))
+                            logging.debug(f"Adding {ip} IP for player {player_name} (ESPN ID: {player_id}, MLB ID: {mlb_id}) on {date_str} to team King Hoser in slot {lineup_slot_id}")
+                    elif stat_category == 'HITS ALLOWED':
+                        team_stats[team_names[team_id]]['total'] += aggregated_stats.get('hits', 0)
+                    elif stat_category == 'ERA':
+                        er = aggregated_stats.get('earnedRuns', 0)
+                        ip = aggregated_stats.get('inningsPitched', 0)
+                        if ip > 0:
+                            if er < 0:
+                                logging.warning(f"Invalid stats for player ID {player_id}: Earned Runs ({er}) < 0")
+                                continue
+                            team_stats[team_names[team_id]]['num'] += er * 9
+                            team_stats[team_names[team_id]]['den'] += ip
+                    elif stat_category == 'WALKS ALLOWED':
+                        team_stats[team_names[team_id]]['total'] += aggregated_stats.get('baseOnBalls', 0)
+                    elif stat_category == 'STRIKEOUTS':
+                        team_stats[team_names[team_id]]['total'] += aggregated_stats.get('strikeOuts', 0)
+                    elif stat_category == 'QUALITY STARTS':
+                        team_stats[team_names[team_id]]['total'] += aggregated_stats.get('qualityStarts', 0)
+                    elif stat_category == 'WINS':
+                        team_stats[team_names[team_id]]['total'] += aggregated_stats.get('wins', 0)
+                    elif stat_category == 'SAVES':
+                        team_stats[team_names[team_id]]['total'] += aggregated_stats.get('saves', 0)
+                    elif stat_category == 'SAVES + HOLDS':
+                        team_stats[team_names[team_id]]['total'] += aggregated_stats.get('saves', 0) + aggregated_stats.get('holds', 0)
+                    elif stat_category == 'WHIP':
+                        hits = aggregated_stats.get('hits', 0)
+                        bb = aggregated_stats.get('baseOnBalls', 0)
+                        ip = aggregated_stats.get('inningsPitched', 0)
+                        if ip > 0:
+                            if hits < 0 or bb < 0:
+                                logging.warning(f"Invalid stats for player ID {player_id}: Hits ({hits}) or Walks ({bb}) < 0")
+                                continue
+                            team_stats[team_names[team_id]]['num'] += hits + bb
+                            team_stats[team_names[team_id]]['den'] += ip
+                    elif stat_category == 'K/BB':
+                        k = aggregated_stats.get('strikeOuts', 0)
+                        bb = aggregated_stats.get('baseOnBalls', 0)
+                        team_stats[team_names[team_id]]['num'] += k
+                        team_stats[team_names[team_id]]['den'] += bb
+            if not daily_stats_found and stat_category in pitching_categories and chunk_date not in all_star_break:
+                no_data_days.append(chunk_date)
+                if is_july_ip_test:
+                    ip_per_day[date_str] = []
+                    logging.debug(f"No pitching stats for {date_str}, added empty IP entry for King Hoser")
+            chunk_date += timedelta(days=1)
+        current = chunk_end + timedelta(days=1)
     
     # Test additions logging
     if is_june_hr_test:
@@ -682,7 +742,11 @@ def get_contest_data(contest_id):
             needs_update = True
     
     logging.debug(f"Computing new stats for contest {contest_id}, needs_update={needs_update}")
-    rankings, chart_data, warning_message, status = compute_contest_stats(contest_id)
+    try:
+        rankings, chart_data, warning_message, status = compute_contest_stats(contest_id)
+    except Exception as e:
+        logging.error(f"Error computing stats for contest {contest_id}: {str(e)}")
+        raise ValueError(f"Error computing contest stats: {str(e)}")
     
     new_result = ContestResult(
         contest_id=contest_id,
@@ -693,7 +757,12 @@ def get_contest_data(contest_id):
         last_updated=datetime.now(timezone.utc)
     )
     db.session.add(new_result)
-    db.session.commit()
+    try:
+        db.session.commit()
+    except Exception as e:
+        logging.error(f"Database error storing contest result for {contest_id}: {str(e)}")
+        db.session.rollback()
+        raise ValueError(f"Database error: {str(e)}")
     logging.debug(f"Saved new ContestResult for contest {contest_id}")
     
     return rankings, chart_data, warning_message, status
@@ -715,7 +784,13 @@ def register():
         hashed_password = generate_password_hash(form.password.data, method='scrypt')
         new_user = User(username=form.username.data, email=form.email.data, password_hash=hashed_password)
         db.session.add(new_user)
-        db.session.commit()
+        try:
+            db.session.commit()
+        except Exception as e:
+            logging.error(f"Database error during registration: {str(e)}")
+            db.session.rollback()
+            flash("Error creating user. Please try again.", "error")
+            return render_template('register.html', form=form)
         login_user(new_user)
         return redirect(url_for('link_league'))
     return render_template('register.html', form=form)
@@ -776,7 +851,13 @@ def link_league():
         new_league.set_espn_s2(espn_s2)
         new_league.set_swid(swid)
         db.session.add(new_league)
-        db.session.commit()
+        try:
+            db.session.commit()
+        except Exception as e:
+            logging.error(f"Database error during league linking: {str(e)}")
+            db.session.rollback()
+            flash("Error linking league. Please try again.", "error")
+            return render_template('link_league.html', form=form)
         return redirect(url_for('dashboard'))
     return render_template('link_league.html', form=form)
 
@@ -800,9 +881,14 @@ def create_contest():
             title=form.title.data
         )
         db.session.add(contest)
-        db.session.commit()
+        try:
+            db.session.commit()
+        except Exception as e:
+            logging.error(f"Database error during contest creation: {str(e)}")
+            db.session.rollback()
+            flash("Error creating contest. Please try again.", "error")
+            return render_template('create_contest.html', form=form, current_date=date.today().strftime('%Y-%m-%d'), start_of_month=date.today().replace(day=1).strftime('%Y-%m-%d'), leagues=current_user.leagues)
         
-        # Compute and store results immediately if contest has started
         start_date = date.fromisoformat(contest.start_date)
         if start_date <= date.today():
             try:
@@ -873,7 +959,13 @@ def delete_contest(contest_id):
     if contest and contest.user_id == current_user.id:
         ContestResult.query.filter_by(contest_id=contest_id).delete()
         db.session.delete(contest)
-        db.session.commit()
+        try:
+            db.session.commit()
+        except Exception as e:
+            logging.error(f"Database error during contest deletion: {str(e)}")
+            db.session.rollback()
+            flash("Error deleting contest. Please try again.", "error")
+            return redirect(url_for('dashboard'))
         cache.delete_memoized(compute_contest_stats, contest_id)
         flash("Contest deleted successfully.", "success")
     else:
@@ -885,7 +977,13 @@ def delete_contest(contest_id):
 def clear_contests():
     ContestResult.query.filter(ContestResult.contest_id.in_([c.id for c in current_user.contests])).delete()
     Contest.query.filter_by(user_id=current_user.id).delete()
-    db.session.commit()
+    try:
+        db.session.commit()
+    except Exception as e:
+        logging.error(f"Database error during contests clearing: {str(e)}")
+        db.session.rollback()
+        flash("Error clearing contests. Please try again.", "error")
+        return redirect(url_for('dashboard'))
     cache.clear()
     flash("All contests cleared successfully.", "success")
     return redirect(url_for('dashboard'))
@@ -949,7 +1047,13 @@ def clear_leagues():
     ContestResult.query.filter(ContestResult.contest_id.in_([c.id for c in current_user.contests])).delete()
     Contest.query.filter_by(user_id=current_user.id).delete()
     League.query.filter_by(user_id=current_user.id).delete()
-    db.session.commit()
+    try:
+        db.session.commit()
+    except Exception as e:
+        logging.error(f"Database error during leagues clearing: {str(e)}")
+        db.session.rollback()
+        flash("Error clearing leagues. Please try again.", "error")
+        return redirect(url_for('link_league'))
     cache.clear()
     flash("All leagues cleared successfully. Please link your leagues again.", "success")
     return redirect(url_for('link_league'))
