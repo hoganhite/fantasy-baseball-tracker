@@ -94,8 +94,8 @@ class League(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True)
     name = db.Column(db.String(100))
     espn_league_id = db.Column(db.Integer, nullable=False)
-    espn_s2 = db.Column(db.String(255), nullable=False)
-    swid = db.Column(db.String(255), nullable=False)
+    espn_s2 = db.Column(db.String(512), nullable=False)  # Increased to 512
+    swid = db.Column(db.String(512), nullable=False)     # Increased to 512
     active_pitcher_slots = db.Column(db.Text, nullable=True)  # Store as JSON string
     contests = db.relationship('Contest', backref='league', lazy=True)
 
