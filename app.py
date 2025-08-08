@@ -407,6 +407,8 @@ def compute_contest_stats(contest_id):
             # Process in weekly chunks
             chunk_size = 7
             current = start_date
+            player_count = 0
+            max_players = 20  # Limit for testing
             while current <= effective_end:
                 chunk_end = min(current + timedelta(days=chunk_size - 1), effective_end)
                 logging.debug(f"Processing chunk from {current} to {chunk_end}")
@@ -465,6 +467,10 @@ def compute_contest_stats(contest_id):
                     group = 'hitting' if stat_category in hitting_categories else 'pitching'
                     for team_id, players in started_players.items():
                         for player_id, player_name, lineup_slot_id in players:
+                            if player_count >= max_players:
+                                logging.debug(f"Reached max player limit ({max_players}) for testing")
+                                break
+                            player_count += 1
                             if player_id not in mlb_id_cache:
                                 mlb_id = get_mlb_id(player_name, player_id)
                                 if mlb_id:
@@ -497,7 +503,7 @@ def compute_contest_stats(contest_id):
                                 try:
                                     game_log = game_log_data['stats'][0]['splits']
                                     game_log_cache[cache_key] = game_log
-                                    max_attempts_cache = 3
+                                    max_attempts_cache = max_attempts
                                     attempts_cache = 0
                                     while attempts_cache < max_attempts_cache:
                                         try:
@@ -668,12 +674,19 @@ def compute_contest_stats(contest_id):
                                 bb = aggregated_stats.get('baseOnBalls', 0)
                                 team_stats[team_names[team_id]]['num'] += k
                                 team_stats[team_names[team_id]]['den'] += bb
+                        if player_count >= max_players:
+                            break
+                    if player_count >= max_players:
+                        break
                     if not daily_stats_found and stat_category in pitching_categories and chunk_date not in all_star_break:
                         no_data_days.append(chunk_date)
                         if is_july_ip_test:
                             ip_per_day[date_str] = []
                             logging.debug(f"No pitching stats for {date_str}, added empty IP entry for King Hoser")
                     chunk_date += timedelta(days=1)
+                if player_count >= max_players:
+                    logging.debug(f"Stopping chunk processing at {chunk_end} due to player limit")
+                    break
                 current = chunk_end + timedelta(days=1)
             
             # Test additions logging
@@ -745,6 +758,8 @@ def compute_contest_stats(contest_id):
             warning_message = ""
             if no_data_days:
                 warning_message = f"Warning: No pitching stats found for {len(no_data_days)} day(s): {', '.join(str(d) for d in no_data_days)}. Try a different date range."
+            if player_count >= max_players:
+                warning_message += f" Warning: Processing limited to {max_players} players for testing."
             
             chart_data = {
                 "labels": [team for team, _ in rankings],
