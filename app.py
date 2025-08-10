@@ -149,7 +149,7 @@ class ContestResult(db.Model):
 
 class PlayerCache(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    espn_id = db.Column(db.Integer, nullable=False, unique=True)
+    espn_id = db.Column(db.Integer, nullable=False, unique=True, index=True)
     mlb_id = db.Column(db.Integer, nullable=True)
     player_name = db.Column(db.String(100), nullable=False)
     game_log = db.Column(db.Text, nullable=True)
@@ -1138,40 +1138,63 @@ def my_leagues():
     forms = [DeleteLeagueForm(prefix=str(league.id), league_id=league.id) for league in leagues]
     if request.method == 'POST':
         logging.debug(f"Received POST request to /my-leagues with form data: {request.form}")
+        # Find the form prefix from the submitted data
+        submitted_prefix = None
+        for key in request.form.keys():
+            if key.endswith('-league_id'):
+                submitted_prefix = key.split('-')[0]
+                break
+        
+        if not submitted_prefix:
+            logging.warning("No league_id field found in form data")
+            flash("No league selected for deletion.", "error")
+            return redirect(url_for('my_leagues'))
+        
+        submitted_league_id = request.form.get(f"{submitted_prefix}-league_id")
+        if not submitted_league_id:
+            logging.warning("No league_id value provided in form data")
+            flash("No league selected for deletion.", "error")
+            return redirect(url_for('my_leagues'))
+        
         for form in forms:
-            if form.validate_on_submit():
-                logging.debug(f"Form validated successfully, league_id: {form.league_id.data}")
-                max_attempts = 3
-                attempts = 0
-                while attempts < max_attempts:
-                    try:
-                        league_id = int(form.league_id.data)
-                        league = db.session.get(League, league_id)
-                        if league and league.user_id == current_user.id:
-                            logging.debug(f"Found league {league_id} for user {current_user.id}, deleting...")
-                            ContestResult.query.filter(ContestResult.contest_id.in_([c.id for c in league.contests])).delete()
-                            Contest.query.filter_by(league_id=league.id).delete()
-                            db.session.delete(league)
-                            db.session.commit()
-                            cache.clear()
-                            flash("League deleted successfully.", "success")
-                            logging.info(f"Successfully deleted league {league_id}")
-                            return redirect(url_for('my_leagues'))
-                        else:
-                            logging.warning(f"League {league_id} not found or user {current_user.id} lacks permission")
-                            flash("League not found or you don't have permission to delete it.", "error")
-                            return redirect(url_for('my_leagues'))
-                    except OperationalError as e:
-                        attempts += 1
-                        logging.error(f"Database error during league deletion attempt {attempts}: {str(e)}")
-                        db.session.rollback()
-                        if attempts < max_attempts:
-                            sleep(2)
-                flash("Error deleting league due to database issues. Please try again later.", "error")
-                return redirect(url_for('my_leagues'))
-            else:
-                logging.warning(f"Form validation failed: {form.errors}")
-                flash("Form validation failed.", "error")
+            if form.prefix == submitted_prefix:
+                if form.validate_on_submit():
+                    logging.debug(f"Form validated successfully, league_id: {form.league_id.data}")
+                    max_attempts = 3
+                    attempts = 0
+                    while attempts < max_attempts:
+                        try:
+                            league_id = int(form.league_id.data)
+                            league = db.session.get(League, league_id)
+                            if league and league.user_id == current_user.id:
+                                logging.debug(f"Found league {league_id} for user {current_user.id}, deleting...")
+                                ContestResult.query.filter(ContestResult.contest_id.in_([c.id for c in league.contests])).delete()
+                                Contest.query.filter_by(league_id=league.id).delete()
+                                db.session.delete(league)
+                                db.session.commit()
+                                cache.clear()
+                                flash("League deleted successfully.", "success")
+                                logging.info(f"Successfully deleted league {league_id}")
+                                return redirect(url_for('my_leagues'))
+                            else:
+                                logging.warning(f"League {league_id} not found or user {current_user.id} lacks permission")
+                                flash("League not found or you don't have permission to delete it.", "error")
+                                return redirect(url_for('my_leagues'))
+                        except OperationalError as e:
+                            attempts += 1
+                            logging.error(f"Database error during league deletion attempt {attempts}: {str(e)}")
+                            db.session.rollback()
+                            if attempts < max_attempts:
+                                sleep(2)
+                    flash("Error deleting league due to database issues. Please try again later.", "error")
+                    return redirect(url_for('my_leagues'))
+                else:
+                    logging.warning(f"Form validation failed for league_id {form.league_id.data}: {form.errors}")
+                    flash(f"Form validation failed: {form.errors}", "error")
+                    return redirect(url_for('my_leagues'))
+        
+        logging.warning(f"No form matched submitted prefix {submitted_prefix}")
+        flash("Invalid league selection.", "error")
         return redirect(url_for('my_leagues'))
     
     leagues_forms = list(zip(leagues, forms))
