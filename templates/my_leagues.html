@@ -46,9 +46,8 @@
                 <td>{{ league.name }}</td>
                 <td>{{ league.espn_league_id }}</td>
                 <td>
-                    <form method="POST" action="{{ url_for('my_leagues') }}" onsubmit="return confirm('Are you sure you want to delete this league? This will also delete any associated contests.');">
+                    <form id="delete-league-{{ league.id }}" name="delete-league-{{ league.id }}" method="POST" action="{{ url_for('my_leagues') }}" onsubmit="return confirm('Are you sure you want to delete this league? This will also delete any associated contests.');">
                         {{ form.hidden_tag() }}
-                        {{ form.league_id }}
                         <button type="submit" class="btn btn-danger btn-sm">Delete</button>
                     </form>
                 </td>
