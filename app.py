@@ -1146,12 +1146,12 @@ def my_leagues():
             if key.endswith('-league_id'):
                 submitted_prefix = key.split('-')[0]
                 break
-       
+      
         if not submitted_prefix:
             logging.warning("No league_id field found in form data")
             flash("No league selected for deletion.", "error")
             return redirect(url_for('my_leagues'))
-       
+      
         # Get the first league_id value to avoid duplicates
         league_id_values = request.form.getlist(f"{submitted_prefix}-league_id")
         if not league_id_values:
@@ -1159,11 +1159,11 @@ def my_leagues():
             flash("No league selected for deletion.", "error")
             return redirect(url_for('my_leagues'))
         submitted_league_id = league_id_values[0]  # Take the first value
-       
+      
         # Find the form with the matching prefix
         for form in forms:
             logging.debug(f"Checking form with prefix: {form._prefix}, submitted_prefix: {submitted_prefix}")
-            if form._prefix == submitted_prefix:
+            if form._prefix.rstrip('-') == submitted_prefix:  # Remove trailing hyphen for comparison
                 form.process(formdata=request.form)  # Bind submitted data to the form
                 if form.validate():  # Use validate() after processing
                     logging.debug(f"Form validated successfully, league_id: {form.league_id.data}")
@@ -1199,7 +1199,7 @@ def my_leagues():
                     logging.warning(f"Form validation failed for league_id {form.league_id.data}: {form.errors}")
                     flash(f"Form validation failed: {form.errors}", "error")
                     return redirect(url_for('my_leagues'))
-       
+      
         logging.warning(f"No form matched submitted prefix {submitted_prefix}")
         flash("Invalid league selection.", "error")
         return redirect(url_for('my_leagues'))
