@@ -1040,7 +1040,7 @@ def create_contest():
         
         return redirect(url_for('results', contest_id=contest.id))
     today = date.today()
-    return render_template('create_contest.html', form=form, current_date=today.strftime('%Y-%m-%d'), start_of_month=date.today().replace(day=1).strftime('%Y-%m-%d'), leagues=current_user.leagues)
+    return render_template('create_contest.html', form=form, current_date=today().strftime('%Y-%m-%d'), start_of_month=date.today().replace(day=1).strftime('%Y-%m-%d'), leagues=current_user.leagues)
 
 @app.route('/dashboard', methods=['GET', 'POST'])
 @login_required
@@ -1150,14 +1150,16 @@ def my_leagues():
             flash("No league selected for deletion.", "error")
             return redirect(url_for('my_leagues'))
         
-        submitted_league_id = request.form.get(f"{submitted_prefix}-league_id")
-        if not submitted_league_id:
-            logging.warning("No league_id value provided in form data")
+        # Get the first league_id value to avoid duplicates
+        league_id_values = request.form.getlist(f"{submitted_prefix}-league_id")
+        if not league_id_values:
+            logging.warning(f"No league_id value provided for prefix {submitted_prefix}")
             flash("No league selected for deletion.", "error")
             return redirect(url_for('my_leagues'))
+        submitted_league_id = league_id_values[0]  # Take the first value
         
         for form in forms:
-            if form.prefix == submitted_prefix:
+            if form._prefix == submitted_prefix:
                 if form.validate_on_submit():
                     logging.debug(f"Form validated successfully, league_id: {form.league_id.data}")
                     max_attempts = 3
