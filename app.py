@@ -53,7 +53,8 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'pool_size': 5,
     'max_overflow': 10,
     'pool_timeout': 30,
-    'pool_recycle': 1800
+    'pool_recycle': 1800,
+    'pool_pre_ping': True  # Added to mitigate database connection issues
 }
 app.config['SESSION_COOKIE_SECURE'] = True
 app.config['SESSION_COOKIE_HTTPONLY'] = True
@@ -68,7 +69,6 @@ cache = Cache(app)
 
 # Logging setup
 logging.basicConfig(level=logging.DEBUG)
-
 HEADERS = {'Connection': 'keep-alive', 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36'}
 MLB_BASE_URL = "https://statsapi.mlb.com/api/v1"
 
@@ -174,7 +174,6 @@ def init_db_with_retries(max_attempts=3, delay=5):
             else:
                 logging.error("Failed to initialize database after max attempts")
                 raise
-
 init_db_with_retries()
 
 # Flask-Login setup
@@ -205,13 +204,13 @@ def get_mlb_id(player_name, player_id):
     if player_id in manual_mlb_mappings:
         logging.debug(f"Using manual mapping for player ID {player_id}: {manual_mlb_mappings[player_id]}")
         return manual_mlb_mappings[player_id]
-    
+   
     # Check database cache
     player_cache = PlayerCache.query.filter_by(espn_id=player_id, season=YEAR).first()
     if player_cache and player_cache.mlb_id:
         logging.debug(f"Database cache hit for MLB ID: {player_cache.mlb_id}")
         return player_cache.mlb_id
-    
+   
     # Fetch from API
     encoded_name = urllib.parse.quote(player_name)
     search_url = f"{MLB_BASE_URL}/people/search?names={encoded_name}&sportId=1&active=true"
@@ -294,7 +293,7 @@ def get_team_rosters(league_id, cookies, start_date, end_date, season_start):
     if cache_key in roster_cache:
         logging.debug(f"Cache hit for rosters: {cache_key}")
         return roster_cache[cache_key]
-    
+   
     rosters = {}
     current = start_date
     while current <= end_date:
@@ -312,7 +311,7 @@ def get_team_rosters(league_id, cookies, start_date, end_date, season_start):
         roster_data = response.json()['teams']
         rosters[current] = roster_data
         current += timedelta(days=1)
-    
+   
     roster_cache[cache_key] = rosters
     logging.debug(f"Stored rosters for {cache_key}")
     return rosters
@@ -343,21 +342,21 @@ def compute_contest_stats(contest_id):
             if not league:
                 logging.error(f"League not found for contest {contest_id}")
                 raise ValueError("Linked league not found.")
-            
+           
             stat_category = contest.stat_category.upper()
             logging.debug(f"Using stat_category: {stat_category}")
             valid_stats = ['OBP', 'HR', 'RBI', 'AVG', 'HITS', 'RUNS SCORED', 'WALKS', 'STOLEN BASES', 'SLUGGING PERCENTAGE', 'INNINGS PITCHED', 'HITS ALLOWED', 'ERA', 'WALKS ALLOWED', 'STRIKEOUTS', 'QUALITY STARTS', 'WINS', 'SAVES', 'SAVES + HOLDS', 'WHIP', 'K/BB']
             if stat_category not in valid_stats:
                 logging.error(f"Invalid stat_category: {stat_category}")
                 raise ValueError(f"Invalid stat_category: {stat_category}. Choose from {', '.join(valid_stats)}.")
-            
+           
             hitting_categories = ['OBP', 'HR', 'RBI', 'AVG', 'HITS', 'RUNS SCORED', 'WALKS', 'STOLEN BASES', 'SLUGGING PERCENTAGE']
             pitching_categories = ['INNINGS PITCHED', 'HITS ALLOWED', 'ERA', 'WALKS ALLOWED', 'STRIKEOUTS', 'QUALITY STARTS', 'WINS', 'SAVES', 'SAVES + HOLDS', 'WHIP', 'K/BB']
-            
+           
             start_date = date.fromisoformat(contest.start_date)
             end_date = date.fromisoformat(contest.end_date)
             today = date.today()
-            
+           
             status = {}
             if start_date > today:
                 status['is_started'] = False
@@ -370,17 +369,17 @@ def compute_contest_stats(contest_id):
                 warning_message = "Contest not started yet."
                 logging.debug(f"Contest {contest_id} not started, returning empty results")
                 return rankings, chart_data, warning_message, status
-            
+           
             effective_end = min(end_date, today)
             no_data_days = []
             all_star_break = [date(2025, 7, 14), date(2025, 7, 15), date(2025, 7, 16), date(2025, 7, 17)]
-            
+           
             cookies = {'espn_s2': league.espn_s2_decrypted, 'swid': league.swid_decrypted}
             team_names = get_team_names(league.espn_league_id, cookies)
-            
+           
             team_stats = {team_name: {'num': 0.0, 'den': 0.0} if stat_category in ['OBP', 'AVG', 'SLUGGING PERCENTAGE', 'ERA', 'WHIP', 'K/BB'] else {'total': 0.0} for team_name in team_names.values()}
             season_start = date(YEAR, 3, 18)
-            
+           
             try:
                 active_pitcher_slots = json.loads(league.active_pitcher_slots) if league.active_pitcher_slots else [13, 14, 15]
                 active_pitcher_slots = [slot for slot in active_pitcher_slots if slot in [13, 14, 15]]
@@ -391,7 +390,7 @@ def compute_contest_stats(contest_id):
                 logging.warning(f"Invalid active_pitcher_slots JSON for league {league.espn_league_id}, using default slots [13, 14, 15]")
                 active_pitcher_slots = [13, 14, 15]
             logging.debug(f"Active pitcher slots for league {league.espn_league_id}: {active_pitcher_slots}")
-            
+           
             # Test additions
             is_june_hr_test = (stat_category == 'HR' and contest.start_date == '2025-06-01' and contest.end_date == '2025-06-30')
             hr_per_day = defaultdict(list) if is_june_hr_test else None
@@ -403,23 +402,21 @@ def compute_contest_stats(contest_id):
             rbi_per_day = defaultdict(list) if is_march_rbi_test or is_april_rbi_test or is_may_rbi_test or is_june_rbi_test or is_july_rbi_test else None
             is_july_ip_test = (stat_category == 'INNINGS PITCHED' and contest.start_date == '2025-07-01' and contest.end_date == '2025-07-31')
             ip_per_day = defaultdict(list) if is_july_ip_test else None
-            
+           
             # Process in weekly chunks
             chunk_size = 7
             current = start_date
-            player_count = 0
-            max_players = 20  # Limit for testing
             while current <= effective_end:
                 chunk_end = min(current + timedelta(days=chunk_size - 1), effective_end)
                 logging.debug(f"Processing chunk from {current} to {chunk_end}")
                 rosters = get_team_rosters(league.espn_league_id, cookies, current, chunk_end, season_start)
-                
+               
                 chunk_date = current
                 while chunk_date <= chunk_end:
                     date_str = chunk_date.strftime('%Y-%m-%d')
                     logging.debug(f"Processing scoring period {(chunk_date - season_start).days + 1} for date {chunk_date}")
                     processed_players.clear()
-                    
+                   
                     roster_data = rosters.get(chunk_date, [])
                     if not roster_data:
                         if chunk_date not in all_star_break or stat_category not in pitching_categories:
@@ -429,7 +426,7 @@ def compute_contest_stats(contest_id):
                             logging.debug(f"No pitching stats for {date_str}, added empty IP entry for King Hoser")
                         chunk_date += timedelta(days=1)
                         continue
-                    
+                   
                     started_players = {}
                     daily_stats_found = False
                     for team in roster_data:
@@ -463,14 +460,10 @@ def compute_contest_stats(contest_id):
                         started_players[team_id] = started
                         logging.debug(f"Team {team_names[team_id]} roster on {chunk_date}: {[(name, id, slot, status) for name, id, slot, status in all_players]}")
                         logging.debug(f"Team {team_names[team_id]} has {len(started)} started players")
-                    
+                   
                     group = 'hitting' if stat_category in hitting_categories else 'pitching'
                     for team_id, players in started_players.items():
                         for player_id, player_name, lineup_slot_id in players:
-                            if player_count >= max_players:
-                                logging.debug(f"Reached max player limit ({max_players}) for testing")
-                                break
-                            player_count += 1
                             if player_id not in mlb_id_cache:
                                 mlb_id = get_mlb_id(player_name, player_id)
                                 if mlb_id:
@@ -485,7 +478,7 @@ def compute_contest_stats(contest_id):
                             if mlb_id in processed_players:
                                 continue
                             processed_players.add(mlb_id)
-                            
+                           
                             cache_key = f"game_log_{player_id}_{YEAR}_{group}"
                             player_cache = PlayerCache.query.filter_by(espn_id=player_id, season=YEAR, group=group).first()
                             if player_cache and player_cache.game_log:
@@ -543,7 +536,7 @@ def compute_contest_stats(contest_id):
                                 logging.debug(f"No stats for player {player_name} on {date_str}")
                                 continue
                             daily_stats_found = True
-                            
+                           
                             aggregated_stats = {}
                             for stat_dict in daily_stats_list:
                                 for key, value in stat_dict.items():
@@ -566,7 +559,7 @@ def compute_contest_stats(contest_id):
                                             else:
                                                 logging.warning(f"Invalid stat value for {key}='{value}' for player {player_name} on {date_str}, skipping")
                                                 aggregated_stats[key] = aggregated_stats.get(key, 0.0)
-                            
+                           
                             logging.debug(f"Aggregated daily stats for player ID {player_id} (MLB ID: {mlb_id}) on {date_str}: {aggregated_stats}")
                             if stat_category == 'OBP':
                                 h = aggregated_stats.get('hits', 0)
@@ -605,7 +598,7 @@ def compute_contest_stats(contest_id):
                                 team_stats[team_names[team_id]]['total'] += rbi
                                 if (is_march_rbi_test or is_april_rbi_test or is_may_rbi_test or is_june_rbi_test or is_july_rbi_test) and team_names[team_id] == "B. Hackenburg" and rbi > 0:
                                     rbi_per_day[date_str].append((player_name, rbi))
-                                    logging.debug(f"Adding {rbi} RBI for player {player_name} (ESPN ID: {player_id}, MLB ID: {mlb_id}) on {date_str} to team B. Hackenburg")
+                                    logging.debug(f"Adding {rbi} RBI for player {player_name} (ESPN ID: {player_id}, MLB ID: {mlb_id}) on {date_str} to team MAY WANT TO REPLACE team B. Hackenburg")
                             elif stat_category == 'HITS':
                                 team_stats[team_names[team_id]]['total'] += aggregated_stats.get('hits', 0)
                             elif stat_category == 'RUNS SCORED':
@@ -674,21 +667,14 @@ def compute_contest_stats(contest_id):
                                 bb = aggregated_stats.get('baseOnBalls', 0)
                                 team_stats[team_names[team_id]]['num'] += k
                                 team_stats[team_names[team_id]]['den'] += bb
-                        if player_count >= max_players:
-                            break
-                    if player_count >= max_players:
-                        break
                     if not daily_stats_found and stat_category in pitching_categories and chunk_date not in all_star_break:
                         no_data_days.append(chunk_date)
                         if is_july_ip_test:
                             ip_per_day[date_str] = []
                             logging.debug(f"No pitching stats for {date_str}, added empty IP entry for King Hoser")
                     chunk_date += timedelta(days=1)
-                if player_count >= max_players:
-                    logging.debug(f"Stopping chunk processing at {chunk_end} due to player limit")
-                    break
                 current = chunk_end + timedelta(days=1)
-            
+           
             # Test additions logging
             if is_june_hr_test:
                 logging.info("June HR Test Results for Team B. Hackenburg (Daily Breakdown):")
@@ -703,7 +689,7 @@ def compute_contest_stats(contest_id):
                     else:
                         logging.info(f"Date {day}: Total HR 0, No HRs hit")
                 logging.info(f"Overall Total HR for B. Hackenburg in June: {int(total_hr)}")
-            
+           
             if is_march_rbi_test or is_april_rbi_test or is_may_rbi_test or is_june_rbi_test or is_july_rbi_test:
                 month = "March" if is_march_rbi_test else "April" if is_april_rbi_test else "May" if is_may_rbi_test else "June" if is_june_rbi_test else "July"
                 logging.info(f"{month} RBI Test Results for Team B. Hackenburg (Daily Breakdown):")
@@ -718,7 +704,7 @@ def compute_contest_stats(contest_id):
                     else:
                         logging.info(f"Date {day}: Total RBI 0, No RBIs")
                 logging.info(f"Overall Total RBI for B. Hackenburg in {month}: {int(total_rbi)}")
-            
+           
             if is_july_ip_test:
                 logging.info("July IP Test Results for King Hoser (Daily Breakdown):")
                 total_ip = 0.0
@@ -735,7 +721,6 @@ def compute_contest_stats(contest_id):
                         logging.info(f"Date {day_str}: Total IP 0.0, No IP")
                     current += timedelta(days=1)
                 logging.info(f"Overall Total IP for King Hoser in July: {format_stat(total_ip, 'INNINGS PITCHED')}")
-
             logging.debug(f"Team {stat_category} components:")
             for team_name, data in team_stats.items():
                 if 'num' in data and 'den' in data:
@@ -743,7 +728,7 @@ def compute_contest_stats(contest_id):
                     logging.debug(f"Team {team_name}: num={data['num']}, den={data['den']}, {stat_category}={value:.4f}")
                 else:
                     logging.debug(f"Team {team_name}: {stat_category}={data['total']}")
-            
+           
             rankings = []
             for team_name, data in team_stats.items():
                 if 'num' in data and 'den' in data:
@@ -751,16 +736,14 @@ def compute_contest_stats(contest_id):
                 else:
                     value = data['total']
                 rankings.append((team_name, value))
-            
+           
             lower_is_better = ['HITS ALLOWED', 'ERA', 'WALKS ALLOWED', 'WHIP']
             rankings.sort(key=lambda x: x[1], reverse=(stat_category not in lower_is_better))
-            
+           
             warning_message = ""
             if no_data_days:
                 warning_message = f"Warning: No pitching stats found for {len(no_data_days)} day(s): {', '.join(str(d) for d in no_data_days)}. Try a different date range."
-            if player_count >= max_players:
-                warning_message += f" Warning: Processing limited to {max_players} players for testing."
-            
+           
             chart_data = {
                 "labels": [team for team, _ in rankings],
                 "datasets": [{
@@ -771,7 +754,7 @@ def compute_contest_stats(contest_id):
                     "borderWidth": 1
                 }]
             }
-            
+           
             status['is_started'] = True
             if end_date > today:
                 status['is_complete'] = False
@@ -788,10 +771,10 @@ def compute_contest_stats(contest_id):
                 else:
                     status['winner'] = []
                     logging.debug(f"Contest {contest_id} has no rankings data")
-            
+           
             logging.debug(f"Computed stats for contest {contest_id}: {len(rankings)} teams, status={status}")
             return rankings, chart_data, warning_message, status
-        
+       
         except OperationalError as e:
             attempts += 1
             logging.error(f"Database error in compute_contest_stats attempt {attempts}: {str(e)}")
@@ -814,12 +797,12 @@ def get_contest_data(contest_id):
             if not contest:
                 logging.error(f"Contest {contest_id} not found in database")
                 raise ValueError("Contest not found.")
-            
+           
             result = ContestResult.query.filter_by(contest_id=contest_id).order_by(ContestResult.last_updated.desc()).first()
             today = date.today()
             end_date = date.fromisoformat(contest.end_date)
             needs_update = not result or (result.last_updated.date() < today and end_date >= today)
-            
+           
             if not needs_update:
                 logging.debug(f"Using stored ContestResult for contest {contest_id}, last updated {result.last_updated}")
                 try:
@@ -827,10 +810,10 @@ def get_contest_data(contest_id):
                 except json.JSONDecodeError as e:
                     logging.error(f"Error decoding JSON for contest {contest_id}: {str(e)}")
                     needs_update = True
-            
+           
             logging.debug(f"Computing new stats for contest {contest_id}, needs_update={needs_update}")
             rankings, chart_data, warning_message, status = compute_contest_stats(contest_id)
-            
+           
             new_result = ContestResult(
                 contest_id=contest_id,
                 rankings=json.dumps(rankings),
@@ -842,9 +825,9 @@ def get_contest_data(contest_id):
             db.session.add(new_result)
             db.session.commit()
             logging.debug(f"Saved new ContestResult for contest {contest_id}")
-            
+           
             return rankings, chart_data, warning_message, status
-        
+       
         except OperationalError as e:
             attempts += 1
             logging.error(f"Database error in get_contest_data attempt {attempts}: {str(e)}")
@@ -1009,7 +992,7 @@ def create_contest():
         if attempts >= max_attempts:
             flash("Error creating contest due to database issues. Please try again later.", "error")
             return render_template('create_contest.html', form=form, current_date=date.today().strftime('%Y-%m-%d'), start_of_month=date.today().replace(day=1).strftime('%Y-%m-%d'), leagues=current_user.leagues)
-        
+       
         start_date = date.fromisoformat(contest.start_date)
         if start_date <= date.today():
             max_attempts = 3
@@ -1037,7 +1020,7 @@ def create_contest():
                         sleep(2)
             if attempts >= max_attempts:
                 flash("Error computing contest stats due to database or API issues. Contest created but results not available.", "error")
-        
+       
         return redirect(url_for('results', contest_id=contest.id))
     today = date.today()
     return render_template('create_contest.html', form=form, current_date=today.strftime('%Y-%m-%d'), start_of_month=date.today().replace(day=1).strftime('%Y-%m-%d'), leagues=current_user.leagues)
@@ -1072,7 +1055,7 @@ def results(contest_id):
     contest = db.session.get(Contest, contest_id)
     if not contest or contest.user_id != current_user.id:
         return "Contest not found or you don't have access."
-    
+   
     try:
         rankings, chart_data, warning_message, status = get_contest_data(contest_id)
     except InvalidToken:
@@ -1080,7 +1063,7 @@ def results(contest_id):
         return redirect(url_for('clear_leagues'))
     except ValueError as e:
         return str(e)
-    
+   
     return render_template('results.html', rankings=rankings, stat_category=contest.stat_category, contest=contest, chart_data=chart_data, warning_message=warning_message, status=status)
 
 @app.route('/delete-contest/<int:contest_id>', methods=['POST'])
@@ -1146,12 +1129,12 @@ def my_leagues():
             if key.endswith('-league_id'):
                 submitted_prefix = key.split('-')[0]
                 break
-      
+       
         if not submitted_prefix:
             logging.warning("No league_id field found in form data")
             flash("No league selected for deletion.", "error")
             return redirect(url_for('my_leagues'))
-      
+       
         # Get the first league_id value to avoid duplicates
         league_id_values = request.form.getlist(f"{submitted_prefix}-league_id")
         if not league_id_values:
@@ -1159,7 +1142,7 @@ def my_leagues():
             flash("No league selected for deletion.", "error")
             return redirect(url_for('my_leagues'))
         submitted_league_id = league_id_values[0]  # Take the first value
-      
+       
         # Find the form with the matching prefix
         for form in forms:
             logging.debug(f"Checking form with prefix: {form._prefix}, submitted_prefix: {submitted_prefix}")
@@ -1199,7 +1182,7 @@ def my_leagues():
                     logging.warning(f"Form validation failed for league_id {form.league_id.data}: {form.errors}")
                     flash(f"Form validation failed: {form.errors}", "error")
                     return redirect(url_for('my_leagues'))
-      
+       
         logging.warning(f"No form matched submitted prefix {submitted_prefix}")
         flash("Invalid league selection.", "error")
         return redirect(url_for('my_leagues'))
