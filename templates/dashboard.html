@@ -41,6 +41,14 @@
             padding: 1rem;
             color: #4CAF50;
         }
+        .btn-primary {
+            background-color: #2196F3;
+            border-color: #2196F3;
+        }
+        .btn-primary:hover {
+            background-color: #1976D2;
+            border-color: #1976D2;
+        }
     </style>
 {% endblock %}
 {% block content %}
@@ -109,7 +117,7 @@
                     <form action="{{ url_for('delete_contest', contest_id=data.contest.id) }}" method="post" class="d-inline">
                         <button type="submit" class="btn btn-danger" onclick="event.stopPropagation();">Delete Contest</button>
                     </form>
-                    <a href="https://www.facebook.com/sharer/sharer.php?u={{ url_for('results', contest_id=data.contest.id, _external=True) | urlencode }}" target="_blank" class="btn btn-primary" onclick="event.stopPropagation();">Share on Facebook</a>
+                    <a href="{{ url_for('download_snapshot', contest_id=data.contest.id) }}" class="btn btn-primary" onclick="event.stopPropagation();">Download Snapshot</a>
                 </div>
             </div>
         </div>
