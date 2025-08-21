@@ -1101,23 +1101,37 @@ def download_snapshot(contest_id):
             session_cookie = {
                 'name': 'session',
                 'value': request.cookies.get('session'),
-                'domain': 'localhost',
+                'domain': request.host,  # Use the current host (localhost locally, Render domain on server)
                 'path': '/',
                 'secure': False
             }
             context.add_cookies([session_cookie])
+            logging.debug(f"Set session cookie: {session_cookie}")
 
-            # Navigate directly to the results page
+            # Navigate to the results page
             results_url = url_for('results', contest_id=contest_id, _external=True)
+            logging.debug(f"Navigating to results URL: {results_url}")
             page.goto(results_url)
+
+            # Check if contest has started
+            if not status['is_started']:
+                logging.warning("Contest not started, no snapshot area available")
+                flash("Cannot generate snapshot: Contest has not started yet.", "error")
+                browser.close()
+                return redirect(url_for('results', contest_id=contest_id))
 
             # Wait for the snapshot area with a longer timeout
             try:
-                page.wait_for_selector('#snapshot-area', timeout=30000)  # Increased to 30 seconds
-                page.wait_for_selector('#rankingsChart', timeout=30000)  # Increased to 30 seconds
-                page.wait_for_timeout(1000)  # Additional wait for chart rendering
+                page.wait_for_selector('#snapshot-area', timeout=60000)  # Increased to 60 seconds
+                page.wait_for_selector('#rankingsChart', timeout=60000)
+                page.wait_for_timeout(2000)  # Extra wait for chart rendering
             except Exception as e:
                 logging.warning(f"Chart loading warning: {str(e)}. Proceeding with screenshot.")
+
+            # Debug: Capture full page screenshot
+            debug_path = os.path.join(os.path.dirname(__file__), 'debug_full_page.png')
+            page.screenshot(path=debug_path)
+            logging.debug(f"Saved debug screenshot to {debug_path}")
 
             # Capture the snapshot-area div
             snapshot_area = page.locator('#snapshot-area')
@@ -1132,7 +1146,7 @@ def download_snapshot(contest_id):
 
             browser.close()
 
-            # Serve the screenshot as a downloadable file
+            # Serve the screenshot
             temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.png')
             temp_file.write(screenshot_bytes)
             temp_file.close()
